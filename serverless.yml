@@ -2,12 +2,24 @@ service: ml-pipeline-template
 
 plugins:
   - serverless-offline
+  - serverless-step-functions
+
+custom:
+  default_stage: dev
+  region: ap-northeast-1
+  stage: ${opt:stage, self:custom.default_stage}
+  batch:
+    compute_env_name: ${self:service}-compute-env-${self:custom.stage}
+    job_queue_name: ${self:service}-job-queue-${self:custom.stage}
+    job_definition_name: ${self:service}-job-definition-${self:custom.stage}
+    command:
+      - ~/model_learning.py
 
 provider:
   name: aws
   profile: default
-  stage: dev
-  region: ap-northeast-1
+  stage: ${self:custom.stage}
+  region: ${self:custom.region}
   memorySize: 2048
   iam:
     role:
@@ -26,17 +38,160 @@ provider:
             - 'dynamodb:UpdateItem'
           Resource:
             - "*"
+        - Effect: 'Allow'
+          Action:
+            - 'batch:*'
+          Resource: 
+            - "arn:aws:batch:*"
   environment:
     TZ: Asia/Tokyo
+    BUCKET_NAME: ${env:BUCKET_NAME}
+
+resources:
+  Resources:
+    BatchServiceRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - batch.amazonaws.com
+            Action:
+            - sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+    ecsInstanceRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+            - sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+    ecsInstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+        Roles:
+          - !Ref ecsInstanceRole
+    SlsComputeEnv:
+      Type: AWS::Batch::ComputeEnvironment
+      Properties:
+        Type: MANAGED
+        ServiceRole: !GetAtt BatchServiceRole.Arn
+        ComputeEnvironmentName: ${self:custom.batch.compute_env_name}
+        ComputeResources:
+          MaxvCpus: 256
+          MinvCpus: 0
+          InstanceRole: !GetAtt ecsInstanceProfile.Arn
+          Type: EC2
+          InstanceTypes:
+            - optimal
+        State: ENABLED
+    SlsJobQueue:
+      Type: AWS::Batch::JobQueue
+      Properties:
+        JobQueueName: ${self:custom.batch.job_queue}
+        ComputeEnvironmentOrder:
+          - Order: 1
+            ComputeEnvironment: !Ref SlsComputeEnv
+        State: ENABLED
+        Priority: 1
+    SlsJobDefinition:
+      Type: AWS::Batch::JobDefinition
+      Properties:
+        Type: container
+        JobDefinitionName: ${self:custom.batch.job_definition}
+        ContainerProperties:
+          Command: ${self:custom.batch.commands}
+          Memory: 4048
+          Vcpus: 2
+          Image: ${env:MODEL_LEARNING_BATCH_IMAGE_URI}
 
 functions:
   crawl:
     image:
-      name: "${env:IMAGE_URL}"
+      uri:
+        - ${env:LAMBDA_IMAGE_URL}
       command:
         - crawl.crawl
-    events:
-      - schedule: cron(0 0 * * *)
-    timeout: 1200
-    environment:
-      BUCKET_NAME: ${env:BUCKET_NAME}
+    timeout: 900
+  data_processing:
+    image:
+      uri:
+        - ${env:LAMBDA_IMAGE_URL}
+      command:
+        - data_processing.process_data
+    timeout: 900
+  model_learning:
+    image:
+      uri:
+        - ${env:LAMBDA_IMAGE_URL}
+      command:
+        - model_learning.start_model_learning_job
+    timeout: 900
+  model_prediction:
+    image:
+      uri:
+        - ${env:LAMBDA_IMAGE_URL}
+      command:
+        - model_prediction.predict
+    timeout: 900
+  reporting:
+    image:
+      uri:
+        - ${env:LAMBDA_IMAGE_URL}
+      command:
+        - reporting.report
+    timeout: 900
+
+stepFunctions:
+  stateMachines:
+    mlpipelineTemplateSteps1:
+      name: ml-pipeline-template-step1  # crawling -> data processing -> model learning (batch) -> SQS
+      events:
+        - schedule:
+            rate: cron(0 0 * * ? *)
+      definition:
+        StartAt: crawl
+        States:
+          crawl:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [crawl, Arn]
+            Next: data_processing
+          data_processing:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [data_processing, Arn]
+            Next: model_learning
+          model_learning:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [model_learning, Arn]
+            End: true
+    mlpipelineTemplateSteps2:
+      name: ml-pipeline-template-step2  # SQS event -> model prediction -> reporting
+      events:
+        - sqs: ${env:MODEL_LEARNING_END_SQS_ARN}
+      definition:
+        StartAt: model_prediction
+        States:
+          model_prediction:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [model_prediction, Arn]
+            Next: reporting
+          reporting:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [reporting, Arn]
+            End: true
